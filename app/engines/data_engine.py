@@ -17,11 +17,17 @@ class DataEngine:
         self.con.register(dataset_id, df)
 
         return {
-            "dataset_id": dataset_id,
-            "rows": df.shape[0],
-            "columns": df.shape[1],
-            "column_names": list(df.columns)
+            "status": "success",
+            "tool": "load_csv",
+            "result": {
+                "dataset_id": dataset_id,
+                "rows": df.shape[0],
+                "columns": df.shape[1],
+                "column_names": list(df.columns),
+                "preview_rows": df.head(10).to_dict(orient="records")
+            }
         }
+
 
     def run_sql(self, query: str) -> Dict[str, Any]:
         result = self.con.execute(query).fetchdf()

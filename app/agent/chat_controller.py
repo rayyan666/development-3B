@@ -7,9 +7,6 @@ from app.agent.conversation_memory import ConversationMemory
 from app.agent.planner import Planner
 from app.agent.executor import PlanExecutor
 from app.core.orchestrator import Orchestrator
-from app.engines.data_profiler import DataProfiler
-from app.engines.data_strategist_engine import DataStrategistEngine
-from app.state.dataset_registry import DatasetRegistry
 
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -25,9 +22,9 @@ class ChatController:
         self.executor = PlanExecutor(self.orchestrator)
         self.pending_plan = None
 
-    # --------------------------------------------------
+    # ==========================================================
     # LLM Query
-    # --------------------------------------------------
+    # ==========================================================
 
     def query_ollama(self, prompt: str):
         response = requests.post(
@@ -45,108 +42,127 @@ class ChatController:
 
         return response.json()["response"].strip()
 
-    # --------------------------------------------------
-    # Extract prediction features
-    # --------------------------------------------------
+    # ==========================================================
+    # Recursive Extractor (Fix Nested Results)
+    # ==========================================================
 
-    def extract_features_from_text(self, text: str):
-        pattern = r"([\w\. ]+)=([\d\.]+)"
-        matches = re.findall(pattern, text)
+    def _recursive_find(self, obj, key):
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj[key]
+            for v in obj.values():
+                found = self._recursive_find(v, key)
+                if found:
+                    return found
+        return None
 
-        features = {}
-        for key, value in matches:
-            key = key.strip()
-            if "." in value:
-                features[key] = float(value)
-            else:
-                features[key] = int(value)
+    # ==========================================================
+    # Plan Formatting
+    # ==========================================================
 
-        return features
+    def format_plan(self, plan_obj):
+        steps = plan_obj.get("plan", [])
+        explanation = plan_obj.get("explanation", "")
 
-    # --------------------------------------------------
-    # MAIN HANDLE
-    # --------------------------------------------------
+        formatted = "\nProposed Plan:\n\n"
+
+        for i, step in enumerate(steps, 1):
+            formatted += f"{i}. {step.get('tool')} → {step.get('parameters')}\n"
+
+        formatted += f"\nExplanation: {explanation}\n"
+        formatted += "\nProceed? (yes/no)"
+
+        return formatted
+
+    # ==========================================================
+    # Strategy Formatting
+    # ==========================================================
+
+    def format_strategy(self, strategy_result):
+
+        result = strategy_result.get("result", strategy_result)
+
+        summary = "\nDATASET SUMMARY\n\n"
+        summary += f"Rows: {result.get('rows')}\n"
+        summary += f"Columns: {result.get('columns')}\n\n"
+
+        summary += "Numeric Columns:\n"
+        summary += f"{result.get('numeric_columns')}\n\n"
+
+        summary += "Categorical Columns:\n"
+        summary += f"{result.get('categorical_columns')}\n\n"
+
+        summary += (
+            "Please define:\n"
+            "- Problem type (regression / classification / time-series)\n"
+            "- Target column (example: target = DailyHours)\n"
+        )
+
+        return summary
+
+    # ==========================================================
+    # Result Summarization
+    # ==========================================================
+
+    def summarize_results(self, results):
+        return json.dumps(results, indent=2)
+
+    # ==========================================================
+    # MAIN HANDLE FUNCTION
+    # ==========================================================
 
     def handle(self, user_message: str):
 
         lower_msg = user_message.lower()
+
         self.memory.add_user_message(user_message)
         self.memory.messages = self.memory.messages[-12:]
 
-        # ==========================================================
-        # STRATEGIST MODE
-        # ==========================================================
-        
-        if "analyze strategy" in lower_msg:
-        
-            if not self.memory.last_dataset_id:
-                return "No dataset loaded. Please load a dataset first."
-        
-            try:
-                # Registry returns DataFrame directly
-                df = DatasetRegistry.get(self.memory.last_dataset_id)
-        
-                profiler = DataProfiler(df)
-                profile = profiler.profile()  # ✅ FIXED
-        
-                strategist = DataStrategistEngine(profile)
-                strategy = strategist.generate_full_strategy()
-        
-                formatted = "\nDATA STRATEGY REPORT\n\n"
-                formatted += f"Problem Type: {strategy.get('problem_type')}\n"
-                formatted += f"Recommended Target: {strategy.get('recommended_target')}\n"
-                formatted += f"Drop Columns: {strategy.get('drop_columns')}\n"
-                formatted += f"Drop Due To Collinearity: {strategy.get('drop_due_to_collinearity')}\n"
-                formatted += f"Risk Flags: {strategy.get('risk_flags')}\n\n"
-        
-                formatted += "LLM Strategic Reasoning:\n"
-                formatted += strategy.get("llm_reasoning", "None")
-        
-                return formatted
-        
-            except Exception as e:
-                return f"Strategist failed: {str(e)}"
-
-
-        # ==========================================================
-        # PLAN CONFIRMATION MODE
-        # ==========================================================
+        # ------------------------------------------------------
+        # CONFIRM PLAN MODE
+        # ------------------------------------------------------
 
         if self.pending_plan:
 
             if lower_msg in ["yes", "y"]:
 
                 results = self.executor.execute(self.pending_plan["plan"])
+                self.pending_plan = None
 
-                # 🔥 Update memory from executed steps
+                # Update memory properly (FIXED)
                 for step in results:
-                    tool = step.get("tool")
-                    result_data = step.get("result", {})
-                    actual_result = result_data.get("result", result_data)
 
+                    tool = step.get("tool")
+                    result = step.get("result", {})
+
+                    # ---- Dataset Tracking ----
                     if tool == "load_csv":
-                        dataset_id = actual_result.get("dataset_id")
+                        dataset_id = self._recursive_find(result, "dataset_id")
                         if dataset_id:
                             self.memory.last_dataset_id = dataset_id
 
+                    # ---- Model Tracking (FIXED) ----
                     if tool == "train_model":
-                        model_id = actual_result.get("model_id")
+                        model_id = self._recursive_find(result, "model_id")
                         if model_id:
                             self.memory.last_model_id = model_id
 
-                self.pending_plan = None
-                return json.dumps(results, indent=2)
+                    # ---- Strategy Formatting ----
+                    if tool == "analyze_strategy":
+                        return self.format_strategy(result)
+
+                return self.summarize_results(results)
 
             elif lower_msg in ["no", "cancel"]:
                 self.pending_plan = None
                 return "Plan cancelled."
 
             else:
-                return "Please respond with 'yes' or 'no'."
+                return "Please respond with 'yes' to proceed or 'no' to cancel."
 
-        # ==========================================================
-        # PLANNER MODE
-        # ==========================================================
+        # ------------------------------------------------------
+        # PLANNING MODE
+        # ------------------------------------------------------
 
         try:
             plan_obj = self.planner.generate_plan(
@@ -156,18 +172,36 @@ class ChatController:
 
             if "plan" in plan_obj:
                 self.pending_plan = plan_obj
-
-                formatted = "\nProposed Plan:\n\n"
-
-                for i, step in enumerate(plan_obj["plan"], 1):
-                    formatted += f"{i}. {step.get('tool')} → {step.get('parameters')}\n"
-
-                formatted += f"\nExplanation: {plan_obj.get('explanation')}\n"
-                formatted += "\nProceed? (yes/no)"
-
-                return formatted
+                return self.format_plan(plan_obj)
 
         except Exception as e:
             return f"Planner failed: {str(e)}"
 
-        return "I could not understand the request."
+        # ------------------------------------------------------
+        # FALLBACK MODE
+        # ------------------------------------------------------
+
+        prompt = self.memory.build_prompt()
+        model_output = self.query_ollama(prompt)
+        tool_call = ToolParser.parse(model_output)
+
+        if not tool_call:
+            self.memory.add_assistant_message(model_output)
+            return model_output
+
+        tool_name = tool_call["name"]
+        parameters = tool_call["parameters"]
+
+        # Inject dataset automatically
+        if tool_name in ["run_eda", "train_model", "analyze_strategy"]:
+            if self.memory.last_dataset_id:
+                parameters["dataset_id"] = self.memory.last_dataset_id
+
+        # Inject model automatically
+        if tool_name in ["evaluate_model", "get_feature_importance", "predict"]:
+            if self.memory.last_model_id:
+                parameters["model_id"] = self.memory.last_model_id
+
+        result = self.orchestrator.handle(tool_name, parameters)
+
+        return json.dumps(result, indent=2)

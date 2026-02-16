@@ -1,28 +1,82 @@
 import uuid
+import numpy as np
+import pandas as pd
+
 from typing import Dict, Any
 
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import (
+    RandomForestRegressor,
+    RandomForestClassifier,
+    GradientBoostingRegressor,
+    GradientBoostingClassifier,
+)
+from sklearn.model_selection import train_test_split, GridSearchCV
 
 from app.state.dataset_registry import DatasetRegistry
 from app.state.model_registry import ModelRegistry
 
 
-class InvalidModelType(Exception):
-    pass
-
-
 class MLEngine:
+
+    # ==========================================================
+    # MODEL FACTORY (LLM SAFE)
+    # ==========================================================
+
+    def _get_model(self, model_type: str, problem_type: str):
+
+        model_type = model_type.lower().strip()
+        problem_type = problem_type.lower().strip()
+
+        # ---- Aliases to prevent LLM naming mismatch ----
+        aliases = {
+            "linear_regression": "linear",
+            "linreg": "linear",
+            "rf": "random_forest",
+            "randomforest": "random_forest",
+            "gboost": "gradient_boosting",
+            "gb": "gradient_boosting",
+            "logistic_regression": "logistic",
+            "logreg": "logistic",
+        }
+
+        model_type = aliases.get(model_type, model_type)
+
+        models = {
+
+            "regression": {
+                "linear": LinearRegression(),
+                "random_forest": RandomForestRegressor(random_state=42),
+                "gradient_boosting": GradientBoostingRegressor(random_state=42),
+            },
+
+            "classification": {
+                "logistic": LogisticRegression(max_iter=1000),
+                "random_forest": RandomForestClassifier(random_state=42),
+                "gradient_boosting": GradientBoostingClassifier(random_state=42),
+            }
+        }
+
+        if problem_type not in models:
+            raise ValueError(f"Unsupported problem type '{problem_type}'")
+
+        if model_type not in models[problem_type]:
+            raise ValueError(
+                f"Unsupported model type '{model_type}' for '{problem_type}'"
+            )
+
+        return models[problem_type][model_type]
+
+    # ==========================================================
+    # TRAIN MODEL
+    # ==========================================================
 
     def train_model(
         self,
         model_type: str,
         dataset_id: str,
         target_column: str,
-        test_size: float = 0.2,
-        random_state: int = 42
+        problem_type: str = "regression"
     ) -> Dict[str, Any]:
 
         df = DatasetRegistry.get(dataset_id)
@@ -33,76 +87,150 @@ class MLEngine:
         X = df.drop(columns=[target_column])
         y = df[target_column]
 
-        # Only keep numeric columns for MVP
+        # Safe baseline → numeric features only
         X = X.select_dtypes(include=["number"])
 
+        if X.empty:
+            raise ValueError("No numeric features available for training.")
+
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state
+            X, y, test_size=0.2, random_state=42
         )
 
-        model = self._initialize_model(model_type, y)
-
+        model = self._get_model(model_type, problem_type)
         model.fit(X_train, y_train)
 
         model_id = str(uuid.uuid4())
 
+        # 🔥 FIX: Correct ModelRegistry signature
         ModelRegistry.register(
             model_id,
             model,
             {
+                "problem_type": problem_type,
                 "dataset_id": dataset_id,
-                "target_column": target_column,
-                "model_type": model_type,
+                "target": target_column,
                 "features": list(X.columns),
-                "test_size": test_size
+                "model_type": model_type
             }
         )
 
         return {
             "model_id": model_id,
             "model_type": model_type,
+            "problem_type": problem_type,
             "train_rows": len(X_train),
             "test_rows": len(X_test),
             "features_used": list(X.columns)
         }
 
-    def _initialize_model(self, model_type: str, y: pd.Series):
+    # ==========================================================
+    # HYPERPARAMETER TUNING
+    # ==========================================================
 
-        if model_type == "random_forest":
+    def tune_model(
+        self,
+        model_type: str,
+        dataset_id: str,
+        target_column: str,
+        problem_type: str = "regression"
+    ) -> Dict[str, Any]:
 
-            if y.dtype.kind in "ifu":  # numeric → regression
-                return RandomForestRegressor()
-            else:
-                return RandomForestClassifier()
+        df = DatasetRegistry.get(dataset_id)
 
-        elif model_type == "logistic_regression":
-            return LogisticRegression(max_iter=1000)
+        if target_column not in df.columns:
+            raise ValueError(f"Target column '{target_column}' not found.")
 
-        elif model_type == "linear_regression":
-            return LinearRegression()
+        X = df.drop(columns=[target_column])
+        y = df[target_column]
 
-        else:
-            raise InvalidModelType(f"Unsupported model type: {model_type}")
-        
-    def predict(self, model_id: str, input_data: dict):
+        X = X.select_dtypes(include=["number"])
+
+        if X.empty:
+            raise ValueError("No numeric features available for tuning.")
+
+        base_model = self._get_model(model_type, problem_type)
+
+        param_grids = {
+            "random_forest": {
+                "n_estimators": [50, 100, 200],
+                "max_depth": [None, 5, 10],
+            },
+            "gradient_boosting": {
+                "n_estimators": [50, 100],
+                "learning_rate": [0.01, 0.1]
+            }
+        }
+
+        # Normalize name for grid
+        grid_key = model_type.lower().strip()
+        grid_key = {
+            "rf": "random_forest",
+            "randomforest": "random_forest"
+        }.get(grid_key, grid_key)
+
+        if grid_key not in param_grids:
+            raise ValueError("No tuning grid defined for this model")
+
+        grid = GridSearchCV(
+            base_model,
+            param_grids[grid_key],
+            cv=3,
+            n_jobs=-1
+        )
+
+        grid.fit(X, y)
+
+        best_model = grid.best_estimator_
+        model_id = str(uuid.uuid4())
+
+        ModelRegistry.register(
+            model_id,
+            best_model,
+            {
+                "problem_type": problem_type,
+                "dataset_id": dataset_id,
+                "target": target_column,
+                "features": list(X.columns),
+                "model_type": model_type,
+                "best_params": grid.best_params_
+            }
+        )
+
+        return {
+            "model_id": model_id,
+            "best_params": grid.best_params_
+        }
+
+    # ==========================================================
+    # PREDICT
+    # ==========================================================
+
+    def predict(
+        self,
+        model_id: str,
+        input_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
 
         model_entry = ModelRegistry.get(model_id)
-    
+
         if model_entry is None:
             raise ValueError(f"Model '{model_id}' not found.")
-    
+
         model = model_entry["model"]
         metadata = model_entry["metadata"]
-    
-        features = metadata["features"]
-    
-        # Ensure correct order
-        row = [input_data.get(feature) for feature in features]
-    
-        df = pd.DataFrame([row], columns=features)
-    
-        prediction = model.predict(df)[0]
-    
+
+        expected_features = metadata["features"]
+
+        row = []
+        for feature in expected_features:
+            if feature not in input_data:
+                raise ValueError(f"Missing feature '{feature}' in input data.")
+            row.append(input_data[feature])
+
+        X_input = np.array(row).reshape(1, -1)
+        prediction = model.predict(X_input)[0]
+
         return {
             "model_id": model_id,
             "prediction": float(prediction)

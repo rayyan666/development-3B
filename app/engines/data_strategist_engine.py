@@ -1,149 +1,103 @@
-from typing import Dict, Any, List
-import numpy as np
+from app.state.dataset_registry import DatasetRegistry
+from app.engines.data_profiler import DataProfiler
+import pandas as pd
 
 
 class DataStrategistEngine:
 
-    def __init__(self, profile: Dict[str, Any]):
-        self.profile = profile
+    def analyze_strategy(self, dataset_id: str):
 
-        self.numeric_columns = profile.get("numeric_columns", [])
-        self.categorical_columns = profile.get("categorical_columns", [])
-        self.column_profile = profile.get("column_profile", {})
-        self.multicollinearity = profile.get("multicollinearity", [])
-        self.rows = profile.get("dataset_summary", {}).get("rows", 0)
+        df = DatasetRegistry.get(dataset_id)
 
-    # --------------------------------------------------
-    # Utility Filters
-    # --------------------------------------------------
+        profiler = DataProfiler(df)
+        profile = profiler.profile()
 
-    def is_constant(self, col: str) -> bool:
-        return self.column_profile[col].get("unique_values", 0) <= 1
+        numeric_cols = profile["numeric_columns"]
+        multicollinearity = profile["multicollinearity"]
+        warnings = []
 
-    def looks_like_id(self, col: str) -> bool:
-        return (
-            "id" in col.lower()
-            or col.lower().endswith("_id")
-            or col.lower() == "s. no."
+        # ----------------------------
+        # TARGET SELECTION
+        # ----------------------------
+
+        candidate_targets = []
+
+        for col in numeric_cols:
+
+            unique_values = profile["column_profile"][col]["unique_values"]
+            std = profile["column_profile"][col].get("std", 0)
+
+            # Ignore constants
+            if unique_values <= 1:
+                continue
+
+            # Ignore ID-like columns
+            if any(keyword in col.lower() for keyword in ["id", "no"]):
+                continue
+
+            # Must have variance
+            if std == 0:
+                continue
+
+            candidate_targets.append(col)
+
+        if not candidate_targets:
+            return {
+                "problem_type": None,
+                "recommended_target": None,
+                "drop_columns": None,
+                "drop_due_to_collinearity": None,
+                "risk_flags": ["no_valid_target_found"]
+            }
+
+        # Prefer highest variance column
+        recommended_target = max(
+            candidate_targets,
+            key=lambda c: profile["column_profile"][c].get("std", 0)
         )
 
-    def low_variance_numeric(self, col: str) -> bool:
-        std = self.column_profile[col].get("std")
-        return std == 0 or std is None
+        problem_type = "regression"
 
-    # --------------------------------------------------
-    # Feature Cleaning
-    # --------------------------------------------------
+        # ----------------------------
+        # COLLINEARITY HANDLING
+        # ----------------------------
 
-    def get_drop_columns(self) -> List[str]:
+        drop_due_to_collinearity = []
 
-        drops = []
+        for pair in multicollinearity:
+            if pair["feature_1"] == recommended_target:
+                drop_due_to_collinearity.append(pair["feature_2"])
+            elif pair["feature_2"] == recommended_target:
+                drop_due_to_collinearity.append(pair["feature_1"])
 
-        for col in self.numeric_columns + self.categorical_columns:
+        # ----------------------------
+        # DROP ID / LOW VALUE COLUMNS
+        # ----------------------------
 
-            if self.is_constant(col):
-                drops.append(col)
-                continue
+        drop_columns = []
 
-            if self.looks_like_id(col):
-                drops.append(col)
-                continue
+        for col, meta in profile["column_profile"].items():
 
-            if col in self.numeric_columns and self.low_variance_numeric(col):
-                drops.append(col)
+            if meta["unique_values"] == 1:
+                drop_columns.append(col)
 
-        return list(set(drops))
+            if any(keyword in col.lower() for keyword in ["id", "name"]):
+                drop_columns.append(col)
 
-    # --------------------------------------------------
-    # Handle Multicollinearity
-    # --------------------------------------------------
+        # ----------------------------
+        # RISK FLAGS
+        # ----------------------------
 
-    def resolve_multicollinearity(self) -> List[str]:
+        if profile["dataset_summary"]["rows"] < 100:
+            warnings.append("small_dataset")
 
-        to_drop = []
-
-        for pair in self.multicollinearity:
-            if abs(pair.get("correlation", 0)) >= 0.95:
-                # Drop second feature deterministically
-                to_drop.append(pair["feature_2"])
-
-        return list(set(to_drop))
-
-    # --------------------------------------------------
-    # Determine Target Candidates
-    # --------------------------------------------------
-
-    def determine_targets(self):
-
-        valid_numeric = []
-
-        for col in self.numeric_columns:
-            if (
-                not self.is_constant(col)
-                and not self.looks_like_id(col)
-            ):
-                valid_numeric.append(col)
-
-        # Simple rule:
-        # If numeric column has > 5 unique values → regression candidate
-        regression_targets = []
-        classification_targets = []
-
-        for col in valid_numeric:
-            unique_vals = self.column_profile[col].get("unique_values", 0)
-
-            if unique_vals > 5:
-                regression_targets.append(col)
-            elif 2 <= unique_vals <= 5:
-                classification_targets.append(col)
-
-        return regression_targets, classification_targets
-
-    # --------------------------------------------------
-    # Dataset Risk Detection
-    # --------------------------------------------------
-
-    def risk_flags(self):
-
-        flags = []
-
-        if self.rows < 200:
-            flags.append("small_dataset")
-
-        if len(self.multicollinearity) > 0:
-            flags.append("high_collinearity")
-
-        return flags
-
-    # --------------------------------------------------
-    # Final Strategy Output
-    # --------------------------------------------------
-
-    def build_strategy(self):
-
-        drop_columns = self.get_drop_columns()
-        collinear_drops = self.resolve_multicollinearity()
-        regression_targets, classification_targets = self.determine_targets()
-        risks = self.risk_flags()
-
-        problem_type = None
-        recommended_target = None
-
-        if regression_targets:
-            problem_type = "regression"
-            recommended_target = regression_targets[0]
-        elif classification_targets:
-            problem_type = "classification"
-            recommended_target = classification_targets[0]
-        else:
-            problem_type = "unsupervised"
+        if multicollinearity:
+            warnings.append("high_collinearity")
 
         return {
             "problem_type": problem_type,
             "recommended_target": recommended_target,
-            "drop_columns": drop_columns,
-            "drop_due_to_collinearity": collinear_drops,
-            "regression_targets": regression_targets,
-            "classification_targets": classification_targets,
-            "risk_flags": risks,
+            "drop_columns": list(set(drop_columns)),
+            "drop_due_to_collinearity": list(set(drop_due_to_collinearity)),
+            "risk_flags": warnings
         }
