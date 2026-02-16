@@ -1,17 +1,16 @@
 from fastapi import APIRouter, UploadFile, File
-import shutil
 import os
 import pandas as pd
 
 from app.api.schemas import ToolRequest
 from app.core.orchestrator import Orchestrator
 from app.state.dataset_registry import DatasetRegistry
-from app.agent.chat_controller import ChatController
+from app.state.model_registry import ModelRegistry
+from app.core.session import chat_controller
 from pydantic import BaseModel
 
 router = APIRouter()
 orchestrator = Orchestrator()
-chat_controller = ChatController()
 
 DATA_DIR = "uploaded_datasets"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -23,9 +22,7 @@ class SetDatasetRequest(BaseModel):
 
 @router.post("/upload-file")
 async def upload_file(file: UploadFile = File(...)):
-
     contents = await file.read()
-
     df = pd.read_csv(pd.io.common.BytesIO(contents))
 
     dataset_id = file.filename.replace(".csv", "")
@@ -46,6 +43,7 @@ def invoke_tool(request: ToolRequest):
         parameters=request.parameters
     )
 
+
 @router.get("/datasets")
 def list_datasets():
     return {
@@ -53,9 +51,9 @@ def list_datasets():
         "datasets": DatasetRegistry.list_datasets()
     }
 
+
 @router.get("/preview/{dataset_id}")
 def preview_dataset(dataset_id: str):
-
     if not DatasetRegistry.exists(dataset_id):
         return {"status": "error", "message": "Dataset not found"}
 
@@ -69,16 +67,15 @@ def preview_dataset(dataset_id: str):
         "preview": df.head(20).to_dict(orient="records")
     }
 
+
 @router.get("/profile/{dataset_id}")
 def profile_dataset(dataset_id: str):
-
     if not DatasetRegistry.exists(dataset_id):
         return {"status": "error", "message": "Dataset not found"}
 
-    df = DatasetRegistry.get(dataset_id)
-
     from app.engines.data_profiler import DataProfiler
 
+    df = DatasetRegistry.get(dataset_id)
     profiler = DataProfiler(df)
     profile = profiler.profile()
 
@@ -87,11 +84,14 @@ def profile_dataset(dataset_id: str):
         "profile": profile
     }
 
+
+# ✅ USE GLOBAL CONTROLLER
 @router.post("/chat")
 def chat_endpoint(payload: dict):
     message = payload.get("message")
     response = chat_controller.handle(message)
     return {"response": response}
+
 
 @router.post("/set-active-dataset")
 def set_active_dataset(request: SetDatasetRequest):
@@ -111,3 +111,34 @@ def set_active_dataset(request: SetDatasetRequest):
         "active_dataset": dataset_id
     }
 
+
+@router.get("/inspector")
+def get_inspector_state():
+
+    dataset_id = chat_controller.memory.last_dataset_id
+    model_id = chat_controller.memory.last_model_id
+
+    dataset_info = None
+    model_info = None
+
+    if dataset_id and DatasetRegistry.exists(dataset_id):
+        df = DatasetRegistry.get(dataset_id)
+        dataset_info = {
+            "dataset_id": dataset_id,
+            "rows": df.shape[0],
+            "columns": df.shape[1]
+        }
+
+    if model_id and ModelRegistry.exists(model_id):
+        model_entry = ModelRegistry.get(model_id)
+        model_info = {
+            "model_id": model_id,
+            "problem_type": model_entry["metadata"]["problem_type"],
+            "target": model_entry["metadata"]["target"],
+            "model_type": model_entry["metadata"]["model_type"]
+        }
+
+    return {
+        "dataset": dataset_info,
+        "model": model_info
+    }
