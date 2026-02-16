@@ -1,4 +1,4 @@
-# B3 Bit By Bit
+# B3 (Bit-By-Bit)
 
 A full-stack AI-powered data science workspace that enables dataset management, exploratory analysis, intelligent planning, model training, hyperparameter tuning, evaluation, and conversational orchestration through a unified web interface.
 
