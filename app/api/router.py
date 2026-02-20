@@ -38,10 +38,29 @@ async def upload_file(file: UploadFile = File(...)):
 
 @router.post("/invoke")
 def invoke_tool(request: ToolRequest):
-    return orchestrator.handle(
+
+    result = orchestrator.handle(
         tool_name=request.tool_name,
         parameters=request.parameters
     )
+
+    # ---- Keep memory in sync ----
+    if request.tool_name == "train_model":
+        try:
+            model_id = result["result"]["result"]["model_id"]
+            chat_controller.memory.last_model_id = model_id
+        except:
+            pass
+
+    if request.tool_name == "load_csv":
+        try:
+            dataset_id = result["result"]["result"]["dataset_id"]
+            chat_controller.memory.last_dataset_id = dataset_id
+        except:
+            pass
+
+    return result
+
 
 
 @router.get("/datasets")
@@ -85,7 +104,6 @@ def profile_dataset(dataset_id: str):
     }
 
 
-# ✅ USE GLOBAL CONTROLLER
 @router.post("/chat")
 def chat_endpoint(payload: dict):
     message = payload.get("message")
@@ -141,4 +159,33 @@ def get_inspector_state():
     return {
         "dataset": dataset_info,
         "model": model_info
+    }
+
+
+@router.get("/models/available")
+def get_available_models():
+    from app.engines.ml_engine import MLEngine
+    
+    engine = MLEngine()
+    available_models = engine.list_available_models()
+    
+    return {
+        "status": "success",
+        "models": available_models
+    }
+
+
+@router.get("/hyperparameters/{problem_type}/{model_type}")
+def get_hyperparameters(problem_type: str, model_type: str):
+    """Get hyperparameter ranges for a specific model"""
+    from app.engines.ml_engine import MLEngine
+    
+    engine = MLEngine()
+    param_grid = engine._get_param_grid(model_type, problem_type)
+    
+    return {
+        "status": "success",
+        "model_type": model_type,
+        "problem_type": problem_type,
+        "hyperparameters": param_grid or {}
     }

@@ -1,11 +1,22 @@
 import pandas as pd
 import numpy as np
+import warnings
 
 
 class DataProfiler:
 
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
+
+    # --------------------------------------------------
+    # UTILITY: SANITIZE FLOATS FOR JSON SERIALIZATION
+    # --------------------------------------------------
+
+    def _sanitize_float(self, value):
+        """Convert NaN/inf to None for JSON serialization"""
+        if pd.isna(value) or np.isinf(value):
+            return None
+        return float(value)
 
     # --------------------------------------------------
     # MAIN ENTRY
@@ -21,6 +32,7 @@ class DataProfiler:
             "time_columns": self._time_columns(),
             "target_candidates": self._target_candidates(),
             "multicollinearity": self._multicollinearity(),
+            "correlation_matrix": self._correlation_matrix(),
             "warnings": self._warnings()
         }
 
@@ -72,11 +84,11 @@ class DataProfiler:
             return {}
 
         return {
-            "mean": float(series.mean()),
-            "std": float(series.std()),
-            "min": float(series.min()),
-            "max": float(series.max()),
-            "skewness": float(series.skew())
+            "mean": self._sanitize_float(series.mean()),
+            "std": self._sanitize_float(series.std()),
+            "min": self._sanitize_float(series.min()),
+            "max": self._sanitize_float(series.max()),
+            "skewness": self._sanitize_float(series.skew())
         }
 
     # --------------------------------------------------
@@ -115,7 +127,9 @@ class DataProfiler:
 
         for col in self.df.columns:
             try:
-                parsed = pd.to_datetime(self.df[col], errors="coerce")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    parsed = pd.to_datetime(self.df[col], errors="coerce")
 
                 if parsed.notna().mean() > 0.8:
                     time_cols.append(col)
@@ -161,6 +175,29 @@ class DataProfiler:
         }
 
     # --------------------------------------------------
+    # CORRELATION MATRIX
+    # --------------------------------------------------
+
+    def _correlation_matrix(self):
+
+        numeric_df = self.df.select_dtypes(include=["number"])
+
+        if numeric_df.shape[1] < 2:
+            return {}
+
+        corr_matrix = numeric_df.corr()
+        
+        # Sanitize correlation values to handle NaN
+        sanitized = {}
+        for col in corr_matrix.columns:
+            sanitized[col] = {}
+            for row in corr_matrix.index:
+                value = corr_matrix.loc[row, col]
+                sanitized[col][row] = self._sanitize_float(value)
+        
+        return sanitized
+
+    # --------------------------------------------------
     # MULTICOLLINEARITY DETECTION
     # --------------------------------------------------
 
@@ -177,11 +214,12 @@ class DataProfiler:
 
         for i in range(len(corr_matrix.columns)):
             for j in range(i):
-                if corr_matrix.iloc[i, j] > 0.9:
+                corr_value = corr_matrix.iloc[i, j]
+                if pd.notna(corr_value) and corr_value > 0.9:
                     high_corr_pairs.append({
                         "feature_1": corr_matrix.columns[i],
                         "feature_2": corr_matrix.columns[j],
-                        "correlation": float(corr_matrix.iloc[i, j])
+                        "correlation": self._sanitize_float(corr_value)
                     })
 
         return high_corr_pairs
