@@ -229,13 +229,13 @@ Automatically updates after dataset selection and model training.
 # Running the Backend
 
 ```bash
-uvicorn app.main:app --reload 
+uvicorn main:app --reload 
 
 ```
 
 ```bash
 cd frontend
-npm start
+npm run dev
 ```
 
 # Technology Stack
